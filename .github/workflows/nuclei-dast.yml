@@ -1,0 +1,185 @@
+# Cotygodniowy DAST (Nuclei) działających środowisk – wywoływany z repozytoriów PRYWATNYCH.
+# Nie uruchamiaj go z publicznego repo: logi i artefakty publicznego repo są widoczne dla wszystkich.
+#
+# Skanuj wyłącznie hosty, które należą do DalmaPL. Domyślnie wyłączone są szablony
+# dos / fuzz / intrusive / bruteforce / osint / token-spray oraz OAST (interactsh), a ruch jest limitowany.
+
+name: Nuclei DAST
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: Lista URL-i / hostów (nowa linia, przecinek lub spacja). Pusta = skan pominięty.
+        type: string
+        default: ""
+      severity:
+        description: Poziomy szablonów do uruchomienia.
+        type: string
+        default: medium,high,critical
+      fail-severity:
+        description: "Minimalny poziom findingu przerywający job: low | medium | high | critical | none."
+        type: string
+        default: high
+      templates:
+        description: Katalogi/pliki z nuclei-templates (względnie, przecinki).
+        type: string
+        default: http/,ssl/
+      tags:
+        description: Opcjonalnie – uruchom tylko szablony z tymi tagami (przecinki).
+        type: string
+        default: ""
+      exclude-tags:
+        description: Tagi szablonów wyłączonych ze skanu.
+        type: string
+        default: dos,fuzz,intrusive,bruteforce,osint,token-spray
+      rate-limit:
+        description: Maksymalna liczba żądań na sekundę (łącznie).
+        type: number
+        default: 30
+      interactsh:
+        description: Włącz testy OAST (callbacki przez zewnętrzny serwer interactsh ProjectDiscovery).
+        type: boolean
+        default: false
+      artifact-suffix:
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  nuclei:
+    name: DAST (Nuclei)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions: {} # brak checkoutu i dostępu do API – tylko ruch do targetów
+    env:
+      NUCLEI_VERSION: 3.11.1
+      NUCLEI_SHA256: ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
+      TEMPLATES_VERSION: v10.5.2
+      TEMPLATES_COMMIT: 5442582a875f96887bfe403c6de562de460897e7
+    steps:
+      - name: Validate targets
+        id: targets
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail -f # -f: bez rozwijania globów w podanych targetach
+          out="$RUNNER_TEMP/targets.txt"; : > "$out"; bad=0
+          for t in $(printf '%s' "$TARGETS" | tr ',;' '  '); do
+            case "$t" in http://*|https://*) url="$t" ;; *) url="https://$t" ;; esac
+            if printf '%s' "$url" | grep -Eq '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/%-]*)?$'; then
+              echo "$url" >> "$out"
+            else
+              echo "::error title=Nuclei::Invalid target: $t"; bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          count=$(sort -u "$out" | tee "$out.tmp" | wc -l); mv "$out.tmp" "$out"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice title=Nuclei::No targets configured (set repository variable NUCLEI_TARGETS) – scan skipped"
+          else
+            echo "Targets: $count"
+          fi
+
+      - name: Install Nuclei (pinned + sha256)
+        id: install
+        if: steps.targets.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          zip="nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+          curl -fsSL --retry 3 -o "$zip" \
+            "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/${zip}"
+          echo "${NUCLEI_SHA256}  ${zip}" | sha256sum --check --strict -
+          unzip -oq "$zip" nuclei
+          sudo install -m 0755 nuclei /usr/local/bin/nuclei
+          nuclei -version 2>&1 | tail -1
+
+      - name: Fetch nuclei-templates (pinned)
+        id: templates
+        if: steps.targets.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/nuclei-templates"
+          git clone --quiet --depth 1 --branch "$TEMPLATES_VERSION" \
+            https://github.com/projectdiscovery/nuclei-templates.git "$dir"
+          actual=$(git -C "$dir" rev-parse HEAD)
+          [ "$actual" = "$TEMPLATES_COMMIT" ] || { echo "::error::templates commit $actual != pinned $TEMPLATES_COMMIT"; exit 1; }
+
+      - name: Scan
+        id: scan
+        if: steps.targets.outputs.count != '0'
+        env:
+          SEVERITY: ${{ inputs.severity }}
+          TEMPLATES: ${{ inputs.templates }}
+          TAGS: ${{ inputs.tags }}
+          EXCLUDE_TAGS: ${{ inputs.exclude-tags }}
+          RATE_LIMIT: ${{ inputs.rate-limit }}
+          INTERACTSH: ${{ inputs.interactsh }}
+        run: |
+          set -euo pipefail -f
+          tpl_dir="$RUNNER_TEMP/nuclei-templates"
+          args=(
+            -l "$RUNNER_TEMP/targets.txt"
+            -severity "$SEVERITY"
+            -etags "$EXCLUDE_TAGS"
+            -ept headless,code,file,javascript
+            -rl "$RATE_LIMIT" -c 10 -bs 10 -timeout 10 -retries 1
+            -H "User-Agent: security-ci-nuclei"
+            -duc -nc -omit-raw -stats -si 120
+            -jsonl-export "$PWD/nuclei.jsonl"
+            -sarif-export "$PWD/nuclei.sarif"
+          )
+          for t in $(printf '%s' "$TEMPLATES" | tr ',' ' '); do
+            case "$t" in *..*|/*) echo "::error::templates must be relative paths inside nuclei-templates: $t"; exit 2 ;; esac
+            args+=(-t "$tpl_dir/$t")
+          done
+          [ -n "$TAGS" ] && args+=(-tags "$TAGS")
+          [ "$INTERACTSH" = "true" ] || args+=(-ni)
+          nuclei "${args[@]}"
+          touch nuclei.jsonl
+
+      - name: Evaluate findings
+        id: evaluate
+        if: steps.targets.outputs.count != '0'
+        env:
+          FAIL_SEVERITY: ${{ inputs.fail-severity }}
+        run: |
+          set -euo pipefail
+          rank() { case "$1" in info) echo 0;; low) echo 1;; medium) echo 2;; high) echo 3;; critical) echo 4;; none) echo 99;; *) echo -1;; esac; }
+          min=$(rank "$FAIL_SEVERITY"); [ "$min" -ge 1 ] || { echo "::error::fail-severity must be low|medium|high|critical|none"; exit 2; }
+          total=$(grep -c . nuclei.jsonl || true)
+          {
+            echo "### Nuclei DAST"
+            echo
+            echo "Findings: **$total** · fail-severity: \`$FAIL_SEVERITY\`"
+            if [ "$total" -gt 0 ]; then
+              echo
+              echo "| severity | template | name | matched at |"
+              echo "|---|---|---|---|"
+              jq -r '[.info.severity, ."template-id", (.info.name // "" | gsub("\\|"; "/")), (."matched-at" // .host)] | "| \(.[0]) | `\(.[1])` | \(.[2]) | \(.[3]) |"' nuclei.jsonl \
+                | sort -t'|' -k2,2 | head -100
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"\(.info.severity)\t\(."template-id")\t\(."matched-at" // .host)"' nuclei.jsonl || true
+          blocking=0
+          while read -r sev; do [ "$(rank "$sev")" -ge "$min" ] && blocking=$((blocking + 1)); done \
+            < <(jq -r '.info.severity' nuclei.jsonl)
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error title=Nuclei::$blocking finding(s) at or above '$FAIL_SEVERITY' – see job summary / nuclei-results artifact"
+            exit 1
+          fi
+          echo "Nuclei: $total finding(s), none at or above '$FAIL_SEVERITY'"
+
+      - name: Keep results as artifact
+        if: always() && steps.targets.outputs.count != '0'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nuclei-results${{ inputs.artifact-suffix }}
+          path: |
+            nuclei.jsonl
+            nuclei.sarif
+          if-no-files-found: ignore
+          retention-days: 30

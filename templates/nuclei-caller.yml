@@ -1,0 +1,20 @@
+# Wklej jako .github/workflows/nuclei.yml w repo PRYWATNYM. Cotygodniowy DAST działającego środowiska.
+# Targety: Settings -> Secrets and variables -> Actions -> Variables -> NUCLEI_TARGETS
+# (np. "https://dev.example.pl https://staging.example.pl"). Bez zmiennej skan jest pomijany.
+name: DAST
+
+on:
+  schedule:
+    - cron: "43 4 * * 1" # poniedziałek 04:43 UTC, po skanie Security
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  nuclei:
+    uses: DalmaPL/security-ci/.github/workflows/nuclei-dast.yml@main
+    permissions: {}
+    with:
+      targets: ${{ vars.NUCLEI_TARGETS }}
+      # fail-severity: high     # low | medium | high | critical | none
+      # rate-limit: 30          # żądań/s – obniż dla produkcji

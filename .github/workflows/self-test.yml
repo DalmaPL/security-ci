@@ -67,7 +67,7 @@ jobs:
           done
           echo "All expected findings detected."
 
-      - name: Run from repo root – fixture skipped via .security-ci-ignore
+      - name: Run from repo root - fixture skipped via .security-ci-ignore
         env:
           TARGET: "."
           SECURITY_CI_PLAIN: "1"
@@ -75,3 +75,56 @@ jobs:
           bash "$RUNNER_TEMP/wrangler-check.sh" | tee root.txt
           grep -q "NOTICE: .*Ignored directory.*fixtures/workers/insecure" root.txt
           ! grep -q "^ERROR:" root.txt
+
+  # Reusable Nuclei workflow parsuje się i bez targetów kończy się "skipped".
+  nuclei-no-targets:
+    uses: ./.github/workflows/nuclei-dast.yml
+    permissions: {}
+    with:
+      targets: ""
+
+  # Kroki Nuclei (wyciągnięte z reusable workflow) na lokalnym, celowo dziurawym serwerze.
+  nuclei-local:
+    name: Nuclei detects exposed files (localhost)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Serve vulnerable fixture on 127.0.0.1:8080
+        run: |
+          site="$RUNNER_TEMP/site"; mkdir -p "$site/.git"
+          printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n' > "$site/.git/config"
+          printf 'APP_ENV=production\nAPP_KEY=base64:not-a-real-key\nDB_PASSWORD=not-a-real-password\n' > "$site/.env"
+          cd "$site" && nohup python3 -m http.server 8080 --bind 127.0.0.1 > /dev/null 2>&1 &
+          sleep 2
+          curl -fsS http://127.0.0.1:8080/.git/config > /dev/null
+
+      - name: Run Nuclei steps and assert findings
+        env:
+          SEVERITY: medium,high,critical
+          TEMPLATES: http/exposures/configs/
+          TAGS: ""
+          EXCLUDE_TAGS: dos,fuzz,intrusive,bruteforce,osint,token-spray
+          RATE_LIMIT: "50"
+          INTERACTSH: "false"
+          FAIL_SEVERITY: high
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/nuclei-dast.yml
+          eval "$(yq -r '.jobs.nuclei.env | to_entries | .[] | "export " + .key + "=" + .value' "$wf")"
+          echo "http://127.0.0.1:8080" > "$RUNNER_TEMP/targets.txt"
+          for id in install templates scan evaluate; do
+            yq -r ".jobs.nuclei.steps[] | select(.id == \"$id\") | .run" "$wf" > "$RUNNER_TEMP/$id.sh"
+            test -s "$RUNNER_TEMP/$id.sh"
+          done
+          for id in install templates scan; do bash "$RUNNER_TEMP/$id.sh"; done
+          set +e; bash "$RUNNER_TEMP/evaluate.sh"; rc=$?; set -e
+          fail() { echo "::error title=self-test::$1"; exit 1; }
+          [ "$rc" -eq 1 ] || fail "evaluate should fail on a high finding (rc=$rc)"
+          for id in git-config laravel-env; do
+            jq -e --arg id "$id" 'select(."template-id" == $id)' nuclei.jsonl > /dev/null || fail "missing finding: $id"
+          done
+          echo "Nuclei self-test OK"

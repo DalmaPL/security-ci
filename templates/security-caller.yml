@@ -1,13 +1,9 @@
-# Wklej jako .github/workflows/security.yml w repozytorium z Cloudflare Workers.
+# Wklej jako .github/workflows/security.yml. Uruchamiany raz w tygodniu (i ręcznie), nie przy każdym PR.
 name: Security
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-  merge_group:
   schedule:
-    - cron: "27 3 * * 1" # co tydzień: nowe CVE w niezmienionych zależnościach
+    - cron: "27 3 * * 1" # poniedziałek 03:27 UTC
   workflow_dispatch:
 
 permissions:
@@ -27,6 +23,6 @@ jobs:
     # with:
     #   node-version: "24"
     #   package-manager: auto     # npm | pnpm | yarn | bun
-    #   working-directory: "."
+    #   working-directory: "."    # katalog z lockfile (np. frontend, server)
     #   audit-level: high
     #   upload-sarif: false       # repo prywatne bez GitHub Code Security
