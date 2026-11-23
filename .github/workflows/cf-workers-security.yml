@@ -23,7 +23,7 @@ on:
         type: string
         default: auto
       working-directory:
-        description: Katalog z package.json / lockfile / wrangler.* (względem root repo).
+        description: Katalog z package.json / lockfile dla audytu zależności i SBOM (względem root repo). Gitleaks, Semgrep i hardening zawsze skanują całe repo.
         type: string
         default: "."
       audit-level:
@@ -135,11 +135,11 @@ jobs:
           pipx install "semgrep==${SEMGREP_VERSION}"
           semgrep --version
 
-      # Skan z root repo z celem = working-directory, żeby ścieżki w SARIF były względne do repo.
+      # Skan całego repo (front, back, SQL, skrypty) – working-directory dotyczy tylko SCA.
       # Wyjątki: .semgrepignore oraz komentarze `nosemgrep: <rule-id>`.
       - name: Semgrep scan
         env:
-          TARGET: ${{ inputs.working-directory }}
+          TARGET: "."
         run: |
           semgrep scan \
             --metrics=off \
@@ -344,7 +344,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Sprawdza wrangler.toml / wrangler.json / wrangler.jsonc w working-directory (rekurencyjnie):
+      # Sprawdza wrangler.toml / wrangler.json / wrangler.jsonc w całym repo (rekurencyjnie):
       #   ERROR   – wartość w [vars] / [env.*.vars] wygląda na sekret (nazwa lub format wartości)
       #   ERROR   – w git są pliki .dev.vars* / .env* (poza *.example / *.sample / *.template)
       #   WARNING – wartość o wysokiej entropii w vars, brak compatibility_date
@@ -355,7 +355,7 @@ jobs:
       - name: Check wrangler configuration
         id: wrangler-check
         env:
-          TARGET: ${{ inputs.working-directory }}
+          TARGET: "." # self-test podmienia TARGET, żeby sprawdzić pojedynczy fixture
         run: |
           python3 - <<'PY'
           import json, math, os, pathlib, re, subprocess, sys, tomllib

@@ -46,7 +46,7 @@ Wartości o wysokiej entropii i brak `compatibility_date` dają ostrzeżenie. Se
 |---|---|---|
 | `node-version` | `24` | Node.js dla audytu |
 | `package-manager` | `auto` | `auto` (wykrycie po lockfile) / `npm` / `pnpm` / `yarn` / `bun` |
-| `working-directory` | `.` | katalog z `package.json`, lockfile i `wrangler.*` (monorepo: osobne wywołanie per aplikacja) |
+| `working-directory` | `.` | katalog z `package.json` i lockfile dla audytu zależności i SBOM (np. `frontend`, `server`); Gitleaks, Semgrep i `cf-hardening` zawsze skanują całe repo |
 | `audit-level` | `high` | `low` / `moderate` / `high` / `critical` |
 | `fail-on-audit` | `true` | `false` = podatności tylko jako ostrzeżenie |
 | `semgrep-fail-level` | `error` | `error` / `warning` / `note` / `none` |
