@@ -1,0 +1,7 @@
+# Domyślne reguły Gitleaks + wyjątek dla celowo "dziurawego" fixture'a testowego.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Intentionally insecure self-test fixture (fake values)"
+paths = ['''^fixtures/workers/insecure/''']

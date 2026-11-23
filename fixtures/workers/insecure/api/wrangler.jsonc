@@ -1,0 +1,13 @@
+{
+  // Self-test fixture (JSONC): komentarze, "cudzysłowy" i URL https://x.example/y w komentarzu.
+  "name": "selftest-insecure-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  /* komentarz
+     blokowy */
+  "vars": {
+    "WEBHOOK_SIGNING_KEY": "wh-f4ke-signing-key-0000-1111",
+    "UPSTREAM": { "baseUrl": "https://api.example.com", "authToken": "f4ke-upstream-t0ken-2222" },
+    "FEATURE_FLAGS": ["a", "b"],
+  },
+}

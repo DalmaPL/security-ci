@@ -1,0 +1,13 @@
+{
+  // Self-test fixture: poprawna konfiguracja – sekrety przez `wrangler secret put`.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "selftest-clean-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "vars": {
+    "ENVIRONMENT": "production",
+    "API_BASE_URL": "https://api.example.com",
+    "TOKEN_TTL_SECONDS": 3600,
+  },
+}

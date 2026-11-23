@@ -1,0 +1,17 @@
+# Self-test fixture: CELOWO niebezpieczna konfiguracja. Wszystkie wartości są fałszywe.
+# Brak compatibility_date jest zamierzony.
+name = "selftest-insecure-worker"
+main = "src/index.ts"
+
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "debug"
+TOKEN_TTL_SECONDS = 3600
+AUTH_ISSUER_URL = "https://auth.example.com/"
+PUBLIC_API_KEY_HEADER = "X-Api-Key-Header" # security-ci: allow
+API_TOKEN = "q8Zr3vLk2N9xT4bW7yHc1mPd6sFj0aGe"
+DATABASE_URL = "postgres://app:hunter2-not-real@db.example.com:5432/app"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+SESSION_SECRET = "s3ss10n-s3cr3t-f4k3-v4lu3-0000"

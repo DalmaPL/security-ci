@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Aktualizuje przypięte SHA akcji w workflowach security-ci (komentarz `# vX.Y.Z` też).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

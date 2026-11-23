@@ -1,0 +1,68 @@
+# Testy samego pipeline'u: zmiany w cf-workers-security.yml muszą przejść przed użyciem w repo DalmaPL.
+name: Self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Pełny pipeline na czystym Workerze – musi przejść.
+  clean-worker:
+    uses: ./.github/workflows/cf-workers-security.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    with:
+      working-directory: fixtures/workers/clean
+      artifact-suffix: -selftest
+
+  # Krok cf-hardening (wyciągnięty z reusable workflow) na celowo dziurawym Workerze – musi wykryć problemy.
+  insecure-worker:
+    name: cf-hardening detects insecure fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract wrangler check
+        run: |
+          yq -r '.jobs."cf-hardening".steps[] | select(.id == "wrangler-check") | .run' \
+            .github/workflows/cf-workers-security.yml > "$RUNNER_TEMP/wrangler-check.sh"
+          test -s "$RUNNER_TEMP/wrangler-check.sh"
+
+      - name: Run against insecure fixture and assert findings
+        env:
+          TARGET: fixtures/workers/insecure
+          SECURITY_CI_PLAIN: "1"
+        run: |
+          set +e
+          bash "$RUNNER_TEMP/wrangler-check.sh" > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          fail() { echo "::error title=self-test::$1"; exit 1; }
+          [ "$rc" -eq 1 ] || fail "expected exit code 1, got $rc"
+          for needle in \
+            "ERROR: .*wrangler.toml:[0-9]*: Plaintext secret.*vars.API_TOKEN" \
+            "ERROR: .*wrangler.toml:[0-9]*: Plaintext secret.*vars.DATABASE_URL .*credentials in URL" \
+            "ERROR: .*wrangler.toml:[0-9]*: Plaintext secret.*env.staging.vars.SESSION_SECRET" \
+            "ERROR: .*wrangler.jsonc:[0-9]*: Plaintext secret.*vars.WEBHOOK_SIGNING_KEY" \
+            "ERROR: .*wrangler.jsonc:[0-9]*: Plaintext secret.*vars.UPSTREAM.authToken" \
+            "ERROR: .*\.dev\.vars:1: Local secrets file committed" \
+            "WARNING: .*wrangler.toml:1: Missing compatibility_date" \
+            "NOTICE: .*Suppressed.*PUBLIC_API_KEY_HEADER"
+          do
+            grep -Eq -- "$needle" out.txt || fail "missing finding: $needle"
+          done
+          for clean in ENVIRONMENT TOKEN_TTL_SECONDS AUTH_ISSUER_URL LOG_LEVEL .dev.vars.example; do
+            if grep -E "^(ERROR|WARNING): .*[. ]${clean//./\\.}( |\$)" out.txt; then fail "false positive: $clean"; fi
+          done
+          echo "All expected findings detected."

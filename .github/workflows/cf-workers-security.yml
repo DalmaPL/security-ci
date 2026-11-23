@@ -1,0 +1,548 @@
+# Centralny pipeline bezpieczeństwa dla aplikacji Cloudflare Workers (DalmaPL).
+# Wywoływany z repozytoriów docelowych przez `workflow_call` – patrz templates/security-caller.yml.
+#
+# Zadania:
+#   secrets-scan  – Gitleaks na pełnej historii commitów (SARIF -> Code Scanning)
+#   sast          – Semgrep (p/default, p/typescript, p/owasp-top-ten, p/secrets) (SARIF -> Code Scanning)
+#   sca           – audyt zależności (npm/pnpm/yarn/bun) + SBOM CycloneDX
+#   cf-hardening  – wrangler.toml / wrangler.json(c): jawne sekrety w [vars], commitowane .dev.vars/.env
+#
+# Wszystkie akcje firm trzecich są przypięte do pełnego SHA (aktualizuje je Dependabot w security-ci).
+
+name: CF Workers Security
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Wersja Node.js używana do audytu zależności.
+        type: string
+        default: "24"
+      package-manager:
+        description: "auto | npm | pnpm | yarn | bun (auto = wykrycie po lockfile)."
+        type: string
+        default: auto
+      working-directory:
+        description: Katalog z package.json / lockfile / wrangler.* (względem root repo).
+        type: string
+        default: "."
+      audit-level:
+        description: "Minimalny poziom podatności przerywający build: low | moderate | high | critical."
+        type: string
+        default: high
+      fail-on-audit:
+        description: Czy podatności w zależnościach (>= audit-level) mają przerywać build.
+        type: boolean
+        default: true
+      semgrep-fail-level:
+        description: "Minimalny poziom findingu Semgrep przerywający build: error | warning | note | none."
+        type: string
+        default: error
+      upload-sarif:
+        description: Upload SARIF do zakładki Security (wymaga repo publicznego albo GitHub Code Security).
+        type: boolean
+        default: true
+      artifact-suffix:
+        description: Sufiks nazw artefaktów (gdy workflow wołany jest kilka razy w jednym runie, np. monorepo).
+        type: string
+        default: ""
+
+# Domyślnie tylko odczyt; poszczególne joby dostają wyłącznie to, czego potrzebują.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: Secrets scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write # upload SARIF
+      actions: read # wymagane przez upload-sarif w repo prywatnych
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      # Token PR z forka / Dependabota jest read-only -> upload SARIF i tak by się nie udał.
+      CAN_UPLOAD_SARIF: ${{ inputs.upload-sarif && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks (pinned + sha256)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum --check --strict -
+          tar -xzf "$tarball" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # Konfiguracja per repo: .gitleaks.toml (np. [extend] useDefault = true + allowlist)
+      # oraz .gitleaksignore (fingerprinty zaakceptowanych findingów) – wykrywane automatycznie.
+      - name: Scan full git history
+        run: |
+          gitleaks git . \
+            --redact \
+            --no-banner \
+            --exit-code 1 \
+            --report-format sarif \
+            --report-path gitleaks.sarif
+
+      - name: Upload SARIF to Code Scanning
+        if: always() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('gitleaks.sarif') != ''
+        continue-on-error: true # repo prywatne bez Code Security: nie blokuj, SARIF zostaje w artefakcie
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks${{ inputs.artifact-suffix }}
+
+      - name: Keep SARIF as artifact
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gitleaks-sarif${{ inputs.artifact-suffix }}
+          path: gitleaks.sarif
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      SEMGREP_VERSION: 1.186.0
+      CAN_UPLOAD_SARIF: ${{ inputs.upload-sarif && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Semgrep (pinned)
+        run: |
+          pipx install "semgrep==${SEMGREP_VERSION}"
+          semgrep --version
+
+      # Skan z root repo z celem = working-directory, żeby ścieżki w SARIF były względne do repo.
+      # Wyjątki: .semgrepignore oraz komentarze `nosemgrep: <rule-id>`.
+      - name: Semgrep scan
+        env:
+          TARGET: ${{ inputs.working-directory }}
+        run: |
+          semgrep scan \
+            --metrics=off \
+            --disable-version-check \
+            --config p/default \
+            --config p/typescript \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --sarif --output semgrep.sarif \
+            -- "$TARGET"
+
+      - name: Upload SARIF to Code Scanning
+        if: always() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('semgrep.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep${{ inputs.artifact-suffix }}
+
+      - name: Keep SARIF as artifact
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep-sarif${{ inputs.artifact-suffix }}
+          path: semgrep.sarif
+          retention-days: 14
+
+      - name: Evaluate findings
+        env:
+          FAIL_LEVEL: ${{ inputs.semgrep-fail-level }}
+        run: |
+          set -euo pipefail
+          case "$FAIL_LEVEL" in error|warning|note|none) ;; *)
+            echo "::error::semgrep-fail-level must be error|warning|note|none (got '$FAIL_LEVEL')"; exit 2 ;;
+          esac
+          # Poziom findingu: result.level albo defaultConfiguration.level reguły.
+          levels=$(jq -r '
+            .runs[] as $run
+            | ($run.tool.driver.rules // [] | map({key: .id, value: (.defaultConfiguration.level // "warning")}) | from_entries) as $lv
+            | $run.results[]? | (.level // $lv[.ruleId] // "warning")' semgrep.sarif)
+          count() { printf '%s\n' "$levels" | grep -cx "$1" || true; }
+          e=$(count error); w=$(count warning); n=$(count note)
+          {
+            echo "### Semgrep"
+            echo "| error | warning | note | fail level |"
+            echo "|---|---|---|---|"
+            echo "| $e | $w | $n | \`$FAIL_LEVEL\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$FAIL_LEVEL" in
+            error)   blocking=$e ;;
+            warning) blocking=$((e + w)) ;;
+            note)    blocking=$((e + w + n)) ;;
+            none)    blocking=0 ;;
+          esac
+          if [ "$blocking" -gt 0 ]; then
+            echo "::error title=Semgrep::$blocking finding(s) at or above '$FAIL_LEVEL' – see Security tab or the semgrep-sarif artifact"
+            exit 1
+          fi
+          echo "Semgrep: no blocking findings (error=$e warning=$w note=$n)"
+
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA (dependency audit + SBOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect package manager
+        id: pm
+        env:
+          PM_INPUT: ${{ inputs.package-manager }}
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+        run: |
+          set -euo pipefail
+          case "$AUDIT_LEVEL" in low|moderate|high|critical) ;; *)
+            echo "::error::audit-level must be low|moderate|high|critical (got '$AUDIT_LEVEL')"; exit 2 ;;
+          esac
+          if [ ! -f package.json ]; then
+            echo "::notice title=SCA::No package.json in '$PWD' – dependency audit skipped"
+            echo "pm=none" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          pm="$PM_INPUT"
+          if [ "$pm" = auto ]; then
+            if   [ -f pnpm-lock.yaml ]; then pm=pnpm
+            elif [ -f bun.lock ] || [ -f bun.lockb ]; then pm=bun
+            elif [ -f yarn.lock ]; then pm=yarn
+            elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then pm=npm
+            else
+              echo "::error title=SCA::package.json without a lockfile – commit package-lock.json / pnpm-lock.yaml / yarn.lock / bun.lock"
+              exit 1
+            fi
+          fi
+          case "$pm" in npm|pnpm|yarn|bun) ;; *)
+            echo "::error::package-manager must be auto|npm|pnpm|yarn|bun (got '$pm')"; exit 2 ;;
+          esac
+          echo "Detected package manager: $pm"
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        if: steps.pm.outputs.pm != 'none'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false # bez cache – brak ryzyka cache poisoning, audyt i tak nie instaluje paczek
+
+      - name: Setup Bun
+        if: steps.pm.outputs.pm == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Enable Corepack (pnpm / yarn)
+        if: steps.pm.outputs.pm == 'pnpm' || steps.pm.outputs.pm == 'yarn'
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+          PM: ${{ steps.pm.outputs.pm }}
+        run: |
+          npm install --global corepack@0.36.0 --silent
+          corepack enable
+          "$PM" --version
+
+      # Audyt działa wyłącznie na lockfile – bez `install`, więc żadne skrypty postinstall nie są uruchamiane.
+      - name: Dependency audit
+        if: steps.pm.outputs.pm != 'none'
+        env:
+          PM: ${{ steps.pm.outputs.pm }}
+          LEVEL: ${{ inputs.audit-level }}
+          FAIL: ${{ inputs.fail-on-audit }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          set -uo pipefail
+          rc=0
+          case "$PM" in
+            npm)
+              npm audit --package-lock-only --audit-level="$LEVEL" || rc=$? ;;
+            pnpm)
+              pnpm audit --audit-level "$LEVEL" || rc=$? ;;
+            bun)
+              bun audit --audit-level="$LEVEL" || rc=$? ;;
+            yarn)
+              major=$(yarn --version | cut -d. -f1)
+              if [ "$major" -ge 2 ]; then
+                yarn npm audit --all --recursive --severity "$LEVEL" || rc=$?
+              else
+                # Yarn 1: kod wyjścia to maska bitowa, a błąd rejestru też daje !=0 –
+                # dlatego liczymy podatności z auditSummary i failujemy "zamknięcie", gdy go brak.
+                yarn audit --json > "$RUNNER_TEMP/yarn-audit.jsonl" || true
+                node -e '
+                  const fs = require("fs");
+                  const order = ["info", "low", "moderate", "high", "critical"];
+                  const min = order.indexOf(process.argv[2]);
+                  const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean);
+                  const summary = lines.map(l => { try { return JSON.parse(l); } catch { return {}; } })
+                                       .find(o => o.type === "auditSummary");
+                  if (!summary) { console.log("::error title=SCA::yarn audit returned no summary (registry error?)"); process.exit(1); }
+                  const v = summary.data.vulnerabilities;
+                  console.log("yarn audit:", JSON.stringify(v));
+                  const blocking = order.slice(min).reduce((n, k) => n + (v[k] || 0), 0);
+                  process.exit(blocking > 0 ? 1 : 0);
+                ' "$RUNNER_TEMP/yarn-audit.jsonl" "$LEVEL" || rc=$?
+              fi ;;
+          esac
+          if [ "$rc" -ne 0 ]; then
+            if [ "$FAIL" = "true" ]; then
+              echo "::error title=SCA::$PM audit found vulnerabilities >= $LEVEL (or the audit failed)"
+              exit "$rc"
+            fi
+            echo "::warning title=SCA::$PM audit found vulnerabilities >= $LEVEL (fail-on-audit=false)"
+          fi
+
+      - name: Generate SBOM (CycloneDX)
+        if: always() && steps.pm.outputs.pm != 'none'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: ${{ inputs.working-directory }}
+          format: cyclonedx-json
+          output-file: ${{ runner.temp }}/sbom.cdx.json
+          artifact-name: sbom${{ inputs.artifact-suffix }}.cdx.json
+          upload-artifact: true
+          upload-release-assets: false
+          dependency-snapshot: false
+
+  # ---------------------------------------------------------------------------
+  cf-hardening:
+    name: Cloudflare Workers hardening
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Sprawdza wrangler.toml / wrangler.json / wrangler.jsonc w working-directory (rekurencyjnie):
+      #   ERROR   – wartość w [vars] / [env.*.vars] wygląda na sekret (nazwa lub format wartości)
+      #   ERROR   – w git są pliki .dev.vars* / .env* (poza *.example / *.sample / *.template)
+      #   WARNING – wartość o wysokiej entropii w vars, brak compatibility_date
+      # Sekrety trzymaj w `wrangler secret put` / Secrets Store, nie w [vars].
+      # Fałszywy alarm: dopisz na końcu linii komentarz `security-ci: allow`.
+      # Ten krok jest też wyciągany i testowany przez .github/workflows/self-test.yml (id musi zostać).
+      - name: Check wrangler configuration
+        id: wrangler-check
+        env:
+          TARGET: ${{ inputs.working-directory }}
+        run: |
+          python3 - <<'PY'
+          import json, math, os, pathlib, re, subprocess, sys, tomllib
+
+          workspace = pathlib.Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd()).resolve()
+          target = (workspace / os.environ.get("TARGET", ".")).resolve()
+          plain = os.environ.get("SECURITY_CI_PLAIN") == "1"
+          SKIP_DIRS = {"node_modules", ".git", ".wrangler", "dist", "build", ".output", "coverage", ".turbo"}
+          CONFIG_NAMES = ("wrangler.toml", "wrangler.json", "wrangler.jsonc")
+          ALLOW_MARK = "security-ci: allow"
+
+          SECRET_NAME = re.compile(
+              r"(secret|token|passw(or)?d|passwd|(^|[_-])pwd($|[_-])|api[_-]?key|private[_-]?key|access[_-]?key"
+              r"|credentials?|signing[_-]?key|encryption[_-]?key|(^|[_-])dsn$|connection[_-]?string"
+              r"|database[_-]?url|(^|[_-])salt$|(^|[_-])key$)",
+              re.I,
+          )
+          SECRET_VALUE = [
+              ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+              ("credentials in URL", re.compile(r"[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.I)),
+              ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
+              ("AWS access key", re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
+              ("GitHub token", re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b")),
+              ("Stripe key", re.compile(r"\b([sr]k_(live|test)_[A-Za-z0-9]{16,}|whsec_[A-Za-z0-9]{16,})\b")),
+              ("Slack token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}")),
+              ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+              ("OpenAI/Anthropic key", re.compile(r"\bsk-(proj-|ant-)?[A-Za-z0-9_-]{20,}")),
+              ("SendGrid key", re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}")),
+          ]
+          PLACEHOLDER = re.compile(
+              r"^(<.*>|\$\{.*\}|\{\{.*\}\}|x{3,}|\*{3,}|changeme|change[-_ ]me|todo|tbd|placeholder|dummy|example.*|your[-_ ].*|none|null|false|true|-)$",
+              re.I,
+          )
+
+          findings = []  # (level, file, line, title, message)
+
+          def rel(p):
+              try:
+                  return p.resolve().relative_to(workspace).as_posix()
+              except ValueError:
+                  return p.as_posix()
+
+          def add(level, path, line, title, msg):
+              findings.append((level, rel(path), line, title, msg))
+
+          def strip_jsonc(text):
+              out, i, n, in_str = [], 0, len(text), False
+              while i < n:
+                  c = text[i]
+                  if in_str:
+                      out.append(c)
+                      if c == "\\" and i + 1 < n:
+                          out.append(text[i + 1]); i += 2; continue
+                      if c == '"':
+                          in_str = False
+                      i += 1; continue
+                  if c == '"':
+                      in_str = True; out.append(c); i += 1; continue
+                  if text.startswith("//", i):
+                      while i < n and text[i] != "\n":
+                          i += 1
+                      continue
+                  if text.startswith("/*", i):
+                      end = text.find("*/", i + 2)
+                      end = n if end == -1 else end + 2
+                      out.append("\n" * text.count("\n", i, end)); i = end; continue
+                  if c == ",":
+                      j = i + 1
+                      while j < n and text[j] in " \t\r\n":
+                          j += 1
+                      if j < n and text[j] in "}]":
+                          i += 1; continue
+                  out.append(c); i += 1
+              return "".join(out)
+
+          def entropy(s):
+              freq = {ch: s.count(ch) for ch in set(s)}
+              return -sum(c / len(s) * math.log2(c / len(s)) for c in freq.values())
+
+          def find_line(lines, key):
+              pat = re.compile(r'(^|[\s{,])["\']?' + re.escape(key) + r'["\']?\s*[=:]')
+              for idx, line in enumerate(lines, 1):
+                  if pat.search(line):
+                      return idx, ALLOW_MARK in line
+              return 1, False
+
+          def walk(obj, prefix=""):
+              if isinstance(obj, dict):
+                  for k, v in obj.items():
+                      yield from walk(v, f"{prefix}.{k}" if prefix else str(k))
+              elif isinstance(obj, list):
+                  for idx, v in enumerate(obj):
+                      yield from walk(v, f"{prefix}[{idx}]")
+              else:
+                  yield prefix, obj
+
+          def check_vars(path, lines, scope, vars_table):
+              if not isinstance(vars_table, dict):
+                  return
+              for name, value in walk(vars_table):
+                  if not isinstance(value, str):
+                      continue
+                  leaf = re.split(r"[.\[]", name)[-1].rstrip("]")
+                  line, allowed = find_line(lines, leaf)
+                  where = f"{scope}.{name}"
+                  v = value.strip()
+                  kind = next((label for label, rx in SECRET_VALUE if rx.search(v)), None)
+                  if kind is None and SECRET_NAME.search(leaf) and len(v) >= 8 and not PLACEHOLDER.match(v) \
+                          and not re.fullmatch(r"https?://[^@\s]*", v):
+                      kind = "secret-like variable name"
+                  if kind:
+                      if allowed:
+                          add("notice", path, line, "Suppressed", f"{where}: '{ALLOW_MARK}' – skipped ({kind})")
+                      else:
+                          add("error", path, line, "Plaintext secret in wrangler vars",
+                              f"{where} looks like a secret ({kind}, {len(v)} chars). "
+                              f"Use `wrangler secret put {leaf}` or Secrets Store instead of [vars].")
+                      continue
+                  if len(v) >= 20 and " " not in v and not v.startswith(("http://", "https://")) \
+                          and entropy(v) >= 4.0 and not allowed:
+                      add("warning", path, line, "High-entropy value in wrangler vars",
+                          f"{where} has a high-entropy value ({len(v)} chars) – make sure it is not a secret.")
+
+          def check_config(path):
+              text = path.read_text(encoding="utf-8")
+              lines = text.splitlines()
+              try:
+                  cfg = tomllib.loads(text) if path.suffix == ".toml" else json.loads(strip_jsonc(text))
+              except Exception as exc:  # noqa: BLE001
+                  add("error", path, 1, "Unparseable wrangler config", f"{type(exc).__name__}: {exc}")
+                  return
+              if not isinstance(cfg, dict):
+                  add("error", path, 1, "Unparseable wrangler config", "top-level value is not an object")
+                  return
+              check_vars(path, lines, "vars", cfg.get("vars"))
+              for env_name, env_cfg in (cfg.get("env") or {}).items():
+                  if isinstance(env_cfg, dict):
+                      check_vars(path, lines, f"env.{env_name}.vars", env_cfg.get("vars"))
+              if not cfg.get("compatibility_date"):
+                  add("warning", path, 1, "Missing compatibility_date",
+                      "Set compatibility_date to pin Workers runtime behaviour.")
+
+          configs = []
+          if target.is_dir():
+              for dirpath, dirnames, filenames in os.walk(target):
+                  dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+                  configs += [pathlib.Path(dirpath) / f for f in filenames if f in CONFIG_NAMES]
+          else:
+              add("error", target, 1, "Bad working-directory", f"{rel(target)} is not a directory")
+          for cfg_path in sorted(configs):
+              check_config(cfg_path)
+
+          # Pliki z lokalnymi sekretami nie powinny być w repozytorium.
+          try:
+              tracked = subprocess.run(["git", "ls-files", "-z", "--", str(target)], cwd=workspace,
+                                       capture_output=True, check=True).stdout.decode().split("\0")
+          except Exception:  # noqa: BLE001
+              tracked = []
+          safe_suffix = (".example", ".sample", ".template", ".dist")
+          for f in filter(None, tracked):
+              base = f.rsplit("/", 1)[-1]
+              if (base == ".dev.vars" or base.startswith(".dev.vars.") or base == ".env" or base.startswith(".env.")) \
+                      and not base.endswith(safe_suffix):
+                  add("error", workspace / f, 1, "Local secrets file committed",
+                      f"{f} is tracked by git – remove it (git rm --cached), add it to .gitignore and rotate its secrets.")
+
+          def esc(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          for level, f, line, title, msg in findings:
+              if plain:
+                  print(f"{level.upper()}: {f}:{line}: {title}: {msg}")
+              else:
+                  print(f"::{level} file={esc(f)},line={line},title={esc(title)}::{esc(msg)}")
+
+          errors = sum(1 for x in findings if x[0] == "error")
+          warnings = sum(1 for x in findings if x[0] == "warning")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary and not plain:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("### Cloudflare Workers hardening\n\n")
+                  fh.write(f"Configs checked: {len(configs)} · errors: {errors} · warnings: {warnings}\n\n")
+                  if findings:
+                      fh.write("| level | file | finding |\n|---|---|---|\n")
+                      for level, f, line, title, msg in findings:
+                          fh.write(f"| {level} | `{f}:{line}` | **{title}** – {msg.replace('|', '/')} |\n")
+          if not configs:
+              print("No wrangler.toml / wrangler.json(c) found – nothing to check.")
+          print(f"wrangler check: {len(configs)} config(s), {errors} error(s), {warnings} warning(s)")
+          sys.exit(1 if errors else 0)
+          PY

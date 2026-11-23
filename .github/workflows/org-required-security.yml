@@ -1,0 +1,24 @@
+# Wrapper do wymuszenia na poziomie organizacji:
+#   Org Settings -> Rules -> Rulesets -> "Require workflows to pass before merging"
+#   -> repo: DalmaPL/security-ci, plik: .github/workflows/org-required-security.yml
+#
+# Ruleset uruchamia ten plik w kontekście repozytorium docelowego na zdarzeniach PR / merge queue.
+# Workflow z samym `workflow_call` nie może być "required", dlatego ten cienki wrapper istnieje osobno.
+# Ścieżka do reusable workflow musi być pełna (owner/repo/...@ref) – `./` wskazywałoby repo docelowe.
+name: Org required security
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    uses: DalmaPL/security-ci/.github/workflows/cf-workers-security.yml@main
+    permissions:
+      contents: read
+      security-events: write
+      actions: read

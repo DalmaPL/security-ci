@@ -1,0 +1,5 @@
+node_modules/
+.wrangler/
+dist/
+# Celowo niebezpieczny fixture testowy (fałszywe sekrety)
+fixtures/workers/insecure/
