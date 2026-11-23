@@ -66,3 +66,12 @@ jobs:
             if grep -E "^(ERROR|WARNING): .*[. ]${clean//./\\.}( |\$)" out.txt; then fail "false positive: $clean"; fi
           done
           echo "All expected findings detected."
+
+      - name: Run from repo root – fixture skipped via .security-ci-ignore
+        env:
+          TARGET: "."
+          SECURITY_CI_PLAIN: "1"
+        run: |
+          bash "$RUNNER_TEMP/wrangler-check.sh" | tee root.txt
+          grep -q "NOTICE: .*Ignored directory.*fixtures/workers/insecure" root.txt
+          ! grep -q "^ERROR:" root.txt

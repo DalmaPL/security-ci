@@ -349,7 +349,8 @@ jobs:
       #   ERROR   – w git są pliki .dev.vars* / .env* (poza *.example / *.sample / *.template)
       #   WARNING – wartość o wysokiej entropii w vars, brak compatibility_date
       # Sekrety trzymaj w `wrangler secret put` / Secrets Store, nie w [vars].
-      # Fałszywy alarm: dopisz na końcu linii komentarz `security-ci: allow`.
+      # Fałszywy alarm: dopisz na końcu linii komentarz `security-ci: allow`;
+      # cały katalog (np. fixture testowy): plik `.security-ci-ignore` w tym katalogu.
       # Ten krok jest też wyciągany i testowany przez .github/workflows/self-test.yml (id musi zostać).
       - name: Check wrangler configuration
         id: wrangler-check
@@ -497,11 +498,18 @@ jobs:
                   add("warning", path, 1, "Missing compatibility_date",
                       "Set compatibility_date to pin Workers runtime behaviour.")
 
-          configs = []
+          # Katalog z plikiem `.security-ci-ignore` jest pomijany (chyba że to sam working-directory).
+          configs, ignored = [], []
           if target.is_dir():
               for dirpath, dirnames, filenames in os.walk(target):
+                  here = pathlib.Path(dirpath)
+                  if here != target and ".security-ci-ignore" in filenames:
+                      ignored.append(here); dirnames[:] = []
+                      add("notice", here / ".security-ci-ignore", 1, "Ignored directory",
+                          f"{rel(here)} skipped by .security-ci-ignore")
+                      continue
                   dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-                  configs += [pathlib.Path(dirpath) / f for f in filenames if f in CONFIG_NAMES]
+                  configs += [here / f for f in filenames if f in CONFIG_NAMES]
           else:
               add("error", target, 1, "Bad working-directory", f"{rel(target)} is not a directory")
           for cfg_path in sorted(configs):
@@ -515,6 +523,8 @@ jobs:
               tracked = []
           safe_suffix = (".example", ".sample", ".template", ".dist")
           for f in filter(None, tracked):
+              if any((workspace / f).resolve().is_relative_to(d) for d in ignored):
+                  continue
               base = f.rsplit("/", 1)[-1]
               if (base == ".dev.vars" or base.startswith(".dev.vars.") or base == ".env" or base.startswith(".env.")) \
                       and not base.endswith(safe_suffix):

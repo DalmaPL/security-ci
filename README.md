@@ -61,7 +61,9 @@ Wartości o wysokiej entropii i brak `compatibility_date` dają ostrzeżenie. Se
    - sekret w `[vars]` → `wrangler secret put NAZWA`, usuń z `wrangler.toml`, **zrotuj** wartość (jest w historii);
    - wyciek w historii → zrotuj sekret; jeśli to fałszywy alarm, dodaj fingerprint do `.gitleaksignore`;
    - finding Semgrep → popraw albo `// nosemgrep: <rule-id>` z uzasadnieniem; wykluczenia ścieżek w `.semgrepignore`;
-   - fałszywy alarm `cf-hardening` → komentarz `security-ci: allow` na końcu linii w `wrangler.*`.
+   - fałszywy alarm `cf-hardening` → komentarz `security-ci: allow` na końcu linii w `wrangler.*`;
+     cały katalog (np. fixture testowy) → pusty plik `.security-ci-ignore` w tym katalogu.
+   Wszystkie wyjątki są plikami w repo, więc przechodzą przez code review.
 4. Po merge'u do `main` alerty pojawią się w **Security → Code scanning** (push na `main` zasila alerty gałęzi domyślnej).
 
 Hurtowe otwarcie PR-ów w wielu repo (Git Bash + `gh`; lista repo do uzupełnienia):
@@ -112,4 +114,5 @@ Zmiany w pipeline najpierw przechodzą [`self-test.yml`](.github/workflows/self-
 
 - `clean-worker` – pełny pipeline na `fixtures/workers/clean` musi przejść;
 - `insecure-worker` – krok `cf-hardening` uruchomiony na `fixtures/workers/insecure` musi wykryć wszystkie zaszyte
-  problemy (fałszywe wartości; fixture jest wykluczony w `.gitleaks.toml` i `.semgrepignore`).
+  problemy (fałszywe wartości; fixture jest wykluczony w `.gitleaks.toml`, `.semgrepignore` i `.security-ci-ignore`,
+  więc `org-required-security.yml` przechodzi także na samym security-ci).
